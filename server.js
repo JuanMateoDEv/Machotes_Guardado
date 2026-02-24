@@ -8,35 +8,36 @@ const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "10mb" }));
 
-// 2) Modelo (machote)
+/* =========================================================
+   Modelo (machote)
+   - Soft delete con status + fechaBaja/fechaAlta
+   - Contenido plano en content.text (recomendado)
+   - Compatibilidad: content.html/json (no rompe)
+   - NO guardamos variables (se ignoran para evitar metadata extra)
+   ========================================================= */
+
 const MachoteSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, index: true },
     areaKey: { type: String, required: true, index: true }, // RH, TES...
-    area: { type: String, default: "" }, // "Recursos Humanos"
-    status: { type: String, enum: ["draft", "active", "inactive"], default: "active" },
+    area: { type: String, default: "" },
+    status: { type: String, enum: ["draft", "active", "inactive"], default: "active", index: true },
 
-    // Guarda el contenido del editor (elige HTML o JSON)
     content: {
+      // ✅ Recomendado: texto plano
+      text: { type: String, default: "" },
+
+      // Compatibilidad con tu front actual (si todavía usa html/json)
       html: { type: String, default: "" },
       json: { type: mongoose.Schema.Types.Mixed, default: null }
     },
 
-    // Para mostrar "Variables: 7"
-    variables: {
-      type: [
-        {
-          key: { type: String, required: true },
-          label: { type: String, default: "" },
-          type: { type: String, default: "string" },
-          required: { type: Boolean, default: false }
-        }
-      ],
-      default: []
-    },
+    // Hoja membretada
+    letterheadUrl: { type: String, default: "" },
 
-    // La hoja membretada (solo URL)
-    letterheadUrl: { type: String, default: "" }
+    // ✅ Auditoría: SOLO cambian cuando cambia status
+    fechaBaja: { type: Date, default: null },
+    fechaAlta: { type: Date, default: null }
   },
   { timestamps: true }
 );
@@ -44,7 +45,7 @@ const MachoteSchema = new mongoose.Schema(
 // Fuerza nombre de colección EXACTO: "machotes"
 const Machote = mongoose.model("Machote", MachoteSchema, "machotes");
 
-// 3) Health
+// 2) Health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 /**
@@ -55,93 +56,64 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 const baseRoutes = ["/machotes", "/templates"];
 
 /* =========================================================
-   ✅ NUEVO: Helpers para detectar y fusionar variables [..]
+   Helpers mínimos
    ========================================================= */
 
-function extractBracketVariables(html = "") {
-  // Captura [Algo] sin permitir corchetes internos (no anidados)
-  const re = /\[([^\[\]]+)\]/g;
-  const set = new Set();
-  let m;
+// Resuelve content final sin romper compat:
+// - si llega content.text lo usamos
+// - si llega content.html lo usamos
+// - si no llega, usamos lo actual (en PUT)
+function resolveFinalContent(incomingContent = {}, currentContent = {}) {
+  const text =
+    typeof incomingContent?.text === "string"
+      ? incomingContent.text
+      : typeof currentContent?.text === "string"
+        ? currentContent.text
+        : "";
 
-  while ((m = re.exec(html)) !== null) {
-    const key = (m[1] || "").trim();
-    if (key) set.add(key);
-  }
+  const html =
+    typeof incomingContent?.html === "string"
+      ? incomingContent.html
+      : typeof currentContent?.html === "string"
+        ? currentContent.html
+        : "";
 
-  return [...set].map((key) => ({
-    key,
-    label: key,
-    type: "string",
-    required: false
-  }));
+  const json =
+    incomingContent?.json !== undefined ? incomingContent.json : (currentContent?.json ?? null);
+
+  return { text, html, json };
 }
 
-function normalizeVariables(list = []) {
-  const out = [];
-  for (const v of Array.isArray(list) ? list : []) {
-    if (!v?.key) continue;
-    const key = String(v.key).trim();
-    if (!key) continue;
+/* =========================================================
+   Routes
+   ========================================================= */
 
-    out.push({
-      key,
-      label: (v.label ?? "").toString(),
-      type: (v.type ?? "string").toString(),
-      required: Boolean(v.required)
-    });
-  }
-  return out;
-}
-
-/**
- * existing tiene prioridad (preserva label/type/required)
- * detected solo agrega las que no existían.
- * NO borramos variables aunque ya no estén en el HTML.
- */
-function mergeVariables(existing = [], detected = []) {
-  const map = new Map();
-
-  for (const v of normalizeVariables(existing)) {
-    map.set(v.key, v);
-  }
-
-  for (const v of normalizeVariables(detected)) {
-    if (!map.has(v.key)) map.set(v.key, v);
-  }
-
-  return [...map.values()].sort((a, b) => a.key.localeCompare(b.key));
-}
-
-/* ========================================================= */
-
-// 4) Listar machotes
-// GET /machotes?areaKey=RH&term=constancia
-// GET /templates?areaKey=RH&term=constancia  (alias)
 baseRoutes.forEach((base) => {
+  // 3) Listar machotes
+  // GET /machotes?areaKey=RH&term=constancia&includeInactive=true|false
   app.get(base, async (req, res) => {
     try {
-      const { areaKey = "", term = "" } = req.query;
+      const { areaKey = "", term = "", includeInactive = "false" } = req.query;
 
       const filter = {};
       if (areaKey) filter.areaKey = areaKey;
       if (term.trim()) filter.title = { $regex: term.trim(), $options: "i" };
 
+      // ✅ Por defecto, excluir inactivos
+      if (includeInactive !== "true") {
+        filter.status = { $ne: "inactive" };
+      }
+
       const items = await Machote.find(filter).sort({ updatedAt: -1 }).lean();
 
-      const mapped = items.map((t) => ({
-        ...t,
-        variablesCount: t.variables?.length || 0
-      }));
-
-      res.json({ items: mapped });
+      res.json({ items });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Error interno", details: err.message });
     }
   });
 
-  // 5) Obtener 1 machote
+  // 4) Obtener 1 machote
   app.get(`${base}/:id`, async (req, res) => {
     try {
       const doc = await Machote.findById(req.params.id).lean();
@@ -153,7 +125,7 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 6) Crear machote
+  // 5) Crear machote
   app.post(base, async (req, res) => {
     try {
       const {
@@ -162,17 +134,19 @@ baseRoutes.forEach((base) => {
         area = "",
         status = "active",
         content = {},
-        variables = [],
+        // variables se ignora (ya no guardamos metadatos extra)
         letterheadUrl = ""
       } = req.body;
 
       if (!title?.trim()) return res.status(400).json({ error: "title es requerido" });
       if (!areaKey?.trim()) return res.status(400).json({ error: "areaKey es requerido" });
 
-      // ✅ NUEVO: detecta variables del HTML y hace merge
-      const html = content.html || "";
-      const detected = extractBracketVariables(html);
-      const mergedVars = mergeVariables(variables, detected);
+      const finalContent = resolveFinalContent(content, {});
+
+      // Auditoría inicial (solo si lo crean ya inactivo)
+      const now = new Date();
+      const fechaBaja = status === "inactive" ? now : null;
+      const fechaAlta = null;
 
       const created = await Machote.create({
         title: title.trim(),
@@ -180,11 +154,13 @@ baseRoutes.forEach((base) => {
         area,
         status,
         content: {
-          html,
-          json: content.json ?? null
+          text: finalContent.text || "",
+          html: finalContent.html || "",
+          json: finalContent.json ?? null
         },
-        variables: mergedVars,
-        letterheadUrl
+        letterheadUrl,
+        fechaBaja,
+        fechaAlta
       });
 
       res.status(201).json({ message: "Machote creado", data: created });
@@ -194,51 +170,53 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 7) Actualizar machote
+  // 6) Actualizar machote
   app.put(`${base}/:id`, async (req, res) => {
     try {
-      // ✅ NUEVO: Traemos el doc actual para hacer merge seguro
       const current = await Machote.findById(req.params.id).lean();
       if (!current) return res.status(404).json({ error: "Machote no encontrado" });
 
-      // ✅ NUEVO: Whitelist para no meter campos raros por error
-      const allowed = ["title", "areaKey", "area", "status", "content", "variables", "letterheadUrl"];
+      // ✅ Whitelist de campos permitidos (evita romper cosas)
+      const allowed = ["title", "areaKey", "area", "status", "content", "letterheadUrl"];
       const body = {};
-      for (const k of allowed) {
-        if (k in req.body) body[k] = req.body[k];
-      }
+      for (const k of allowed) if (k in req.body) body[k] = req.body[k];
 
       // Normaliza strings
       if (typeof body.title === "string") body.title = body.title.trim();
       if (typeof body.areaKey === "string") body.areaKey = body.areaKey.trim();
 
-      // Normaliza content si viene
-      if (body.content && typeof body.content === "object") {
-        body.content = {
-          html: body.content.html ?? current.content?.html ?? "",
-          json: body.content.json ?? current.content?.json ?? null
-        };
+      // Content final (prefer text si viene)
+      const finalContent = resolveFinalContent(body.content, current.content);
+
+      // ✅ Fechas de baja/alta SOLO cuando cambia status
+      const nextStatus = typeof body.status === "string" ? body.status : current.status;
+
+      const statusPatch = {};
+      if (current.status !== nextStatus) {
+        if (nextStatus === "inactive") {
+          statusPatch.fechaBaja = new Date();
+        }
+        if (current.status === "inactive" && nextStatus === "active") {
+          statusPatch.fechaAlta = new Date();
+        }
       }
-
-      // ✅ NUEVO: merge de variables basado en HTML final
-      const finalHtml =
-        typeof body.content?.html === "string"
-          ? body.content.html
-          : (current.content?.html ?? "");
-
-      const detected = extractBracketVariables(finalHtml);
-
-      // Si el front mandó variables, se usan como base; si no, usamos las actuales
-      const baseVars = Array.isArray(body.variables) ? body.variables : (current.variables ?? []);
-      body.variables = mergeVariables(baseVars, detected);
 
       const updated = await Machote.findByIdAndUpdate(
         req.params.id,
-        { $set: body },
+        {
+          $set: {
+            ...body,
+            content: {
+              text: finalContent.text || "",
+              html: finalContent.html || "",
+              json: finalContent.json ?? null
+            },
+            ...statusPatch
+          }
+        },
         { new: true, runValidators: true }
       );
 
-      if (!updated) return res.status(404).json({ error: "Machote no encontrado" });
       res.json({ message: "Machote actualizado", data: updated });
     } catch (err) {
       console.error(err);
@@ -246,12 +224,75 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 8) Borrar machote
+  /* =========================================================
+     ✅ Soft delete: dar de baja / reactivar
+     ========================================================= */
+
+  // 7) Dar de baja
+  app.post(`${base}/:id/deactivate`, async (req, res) => {
+    try {
+      const current = await Machote.findById(req.params.id).lean();
+      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+
+      // Si ya está inactive, no sobreescribir fechaBaja
+      if (current.status === "inactive") {
+        return res.json({ message: "Machote ya estaba dado de baja", data: current });
+      }
+
+      const updated = await Machote.findByIdAndUpdate(
+        req.params.id,
+        { $set: { status: "inactive", fechaBaja: new Date() } },
+        { new: true, runValidators: true }
+      );
+
+      res.json({ message: "Machote dado de baja", data: updated });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Error interno", details: err.message });
+    }
+  });
+
+  // 8) Reactivar
+  app.post(`${base}/:id/reactivate`, async (req, res) => {
+    try {
+      const current = await Machote.findById(req.params.id).lean();
+      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+
+      // Si ya está active, no sobreescribir fechaAlta
+      if (current.status === "active") {
+        return res.json({ message: "Machote ya estaba activo", data: current });
+      }
+
+      const updated = await Machote.findByIdAndUpdate(
+        req.params.id,
+        { $set: { status: "active", fechaAlta: new Date() } },
+        { new: true, runValidators: true }
+      );
+
+      res.json({ message: "Machote reactivado", data: updated });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Error interno", details: err.message });
+    }
+  });
+
+  // 9) DELETE ahora es BAJA (para no romper el front)
   app.delete(`${base}/:id`, async (req, res) => {
     try {
-      const deleted = await Machote.findByIdAndDelete(req.params.id);
-      if (!deleted) return res.status(404).json({ error: "Machote no encontrado" });
-      res.json({ message: "Machote eliminado" });
+      const current = await Machote.findById(req.params.id).lean();
+      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+
+      if (current.status === "inactive") {
+        return res.json({ message: "Machote ya estaba dado de baja", data: current });
+      }
+
+      const updated = await Machote.findByIdAndUpdate(
+        req.params.id,
+        { $set: { status: "inactive", fechaBaja: new Date() } },
+        { new: true, runValidators: true }
+      );
+
+      res.json({ message: "Machote dado de baja", data: updated });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Error interno", details: err.message });
@@ -259,7 +300,7 @@ baseRoutes.forEach((base) => {
   });
 });
 
-// 9) DB + Start
+// 10) DB + Start
 const port = process.env.PORT || 5055;
 
 async function main() {
