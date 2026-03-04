@@ -11,77 +11,91 @@ app.use(express.json({ limit: "10mb" }));
 /* =========================================================
    Modelo (machote)
    - Soft delete con status + fechaBaja/fechaAlta
-   - Contenido plano en content.text (recomendado)
-   - Compatibilidad: content.html/json (no rompe)
-   - NO guardamos variables (se ignoran para evitar metadata extra)
+   - Guardamos SOLO texto en content.text
+   - Ignoramos html/json para no almacenar etiquetas
    ========================================================= */
 
 const MachoteSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, index: true },
-    areaKey: { type: String, required: true, index: true }, // RH, TES...
+    areaKey: { type: String, required: true, index: true },
     area: { type: String, default: "" },
     status: { type: String, enum: ["draft", "active", "inactive"], default: "active", index: true },
 
     content: {
-      // ✅ Recomendado: texto plano
+      // Fuente de verdad: texto plano
       text: { type: String, default: "" },
 
-      // Compatibilidad con tu front actual (si todavía usa html/json)
+      // Se mantienen para compatibilidad de lectura, pero NO se guardarán (se limpian en POST/PUT)
       html: { type: String, default: "" },
       json: { type: mongoose.Schema.Types.Mixed, default: null }
     },
 
-    // Hoja membretada
     letterheadUrl: { type: String, default: "" },
 
-    // ✅ Auditoría: SOLO cambian cuando cambia status
+    // Auditoría de baja/reactivación
     fechaBaja: { type: Date, default: null },
     fechaAlta: { type: Date, default: null }
   },
   { timestamps: true }
 );
 
-// Fuerza nombre de colección EXACTO: "machotes"
 const Machote = mongoose.model("Machote", MachoteSchema, "machotes");
 
 // 2) Health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-/**
- * Helpers:
- * Permitimos usar /machotes (nuevo) y /templates (alias)
- * para que tu front no se rompa.
- */
+// Alias para no romper el front
 const baseRoutes = ["/machotes", "/templates"];
 
 /* =========================================================
-   Helpers mínimos
+   Helpers
    ========================================================= */
 
-// Resuelve content final sin romper compat:
-// - si llega content.text lo usamos
-// - si llega content.html lo usamos
-// - si no llega, usamos lo actual (en PUT)
-function resolveFinalContent(incomingContent = {}, currentContent = {}) {
-  const text =
-    typeof incomingContent?.text === "string"
-      ? incomingContent.text
-      : typeof currentContent?.text === "string"
-        ? currentContent.text
-        : "";
+// Convierte HTML simple a texto plano (sin dependencias)
+function htmlToPlainText(html = "") {
+  if (!html || typeof html !== "string") return "";
 
-  const html =
-    typeof incomingContent?.html === "string"
-      ? incomingContent.html
-      : typeof currentContent?.html === "string"
-        ? currentContent.html
-        : "";
+  let text = html
+    .replace(/<\s*br\s*\/?>/gi, "\n")
+    .replace(/<\/\s*p\s*>/gi, "\n")
+    .replace(/<\/\s*div\s*>/gi, "\n")
+    .replace(/<\/\s*li\s*>/gi, "\n")
+    .replace(/<\s*li\s*>/gi, "- ")
+    .replace(/<\/\s*h[1-6]\s*>/gi, "\n");
 
-  const json =
-    incomingContent?.json !== undefined ? incomingContent.json : (currentContent?.json ?? null);
+  // Quita etiquetas restantes
+  text = text.replace(/<[^>]*>/g, "");
 
-  return { text, html, json };
+  // Decodifica entidades comunes
+  text = text
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  // Limpieza
+  text = text.replace(/\r/g, "");
+  text = text.replace(/[ \t]+\n/g, "\n");
+  text = text.replace(/\n{3,}/g, "\n\n");
+  return text.trim();
+}
+
+// Resuelve el texto final a guardar:
+// - Prioriza incoming.text si viene
+// - Si solo viene incoming.html, lo convierte a texto
+// - Si no viene nada, usa el texto actual (PUT)
+function resolveFinalText(incomingContent = {}, currentContent = {}) {
+  const incomingText = typeof incomingContent?.text === "string" ? incomingContent.text : "";
+  const incomingHtml = typeof incomingContent?.html === "string" ? incomingContent.html : "";
+
+  if (incomingText.trim()) return incomingText.trim();
+  if (incomingHtml.trim()) return htmlToPlainText(incomingHtml);
+
+  const currentText = typeof currentContent?.text === "string" ? currentContent.text : "";
+  return currentText || "";
 }
 
 /* =========================================================
@@ -89,8 +103,7 @@ function resolveFinalContent(incomingContent = {}, currentContent = {}) {
    ========================================================= */
 
 baseRoutes.forEach((base) => {
-  // 3) Listar machotes
-  // GET /machotes?areaKey=RH&term=constancia&includeInactive=true|false
+  // Listar
   app.get(base, async (req, res) => {
     try {
       const { areaKey = "", term = "", includeInactive = "false" } = req.query;
@@ -99,13 +112,12 @@ baseRoutes.forEach((base) => {
       if (areaKey) filter.areaKey = areaKey;
       if (term.trim()) filter.title = { $regex: term.trim(), $options: "i" };
 
-      // ✅ Por defecto, excluir inactivos
+      // Por defecto excluir inactivos
       if (includeInactive !== "true") {
         filter.status = { $ne: "inactive" };
       }
 
       const items = await Machote.find(filter).sort({ updatedAt: -1 }).lean();
-
       res.json({ items });
     } catch (err) {
       console.error(err);
@@ -113,7 +125,7 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 4) Obtener 1 machote
+  // Obtener 1
   app.get(`${base}/:id`, async (req, res) => {
     try {
       const doc = await Machote.findById(req.params.id).lean();
@@ -125,7 +137,7 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 5) Crear machote
+  // Crear
   app.post(base, async (req, res) => {
     try {
       const {
@@ -134,14 +146,14 @@ baseRoutes.forEach((base) => {
         area = "",
         status = "active",
         content = {},
-        // variables se ignora (ya no guardamos metadatos extra)
         letterheadUrl = ""
       } = req.body;
 
       if (!title?.trim()) return res.status(400).json({ error: "title es requerido" });
       if (!areaKey?.trim()) return res.status(400).json({ error: "areaKey es requerido" });
 
-      const finalContent = resolveFinalContent(content, {});
+      // Texto plano final (aunque el front mande html)
+      const finalText = resolveFinalText(content, {});
 
       // Auditoría inicial (solo si lo crean ya inactivo)
       const now = new Date();
@@ -154,9 +166,9 @@ baseRoutes.forEach((base) => {
         area,
         status,
         content: {
-          text: finalContent.text || "",
-          html: finalContent.html || "",
-          json: finalContent.json ?? null
+          text: finalText,
+          html: "",  // no guardar
+          json: null // no guardar
         },
         letterheadUrl,
         fechaBaja,
@@ -170,35 +182,30 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 6) Actualizar machote
+  // Actualizar
   app.put(`${base}/:id`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
       if (!current) return res.status(404).json({ error: "Machote no encontrado" });
 
-      // ✅ Whitelist de campos permitidos (evita romper cosas)
+      // Whitelist para no aceptar basura
       const allowed = ["title", "areaKey", "area", "status", "content", "letterheadUrl"];
       const body = {};
       for (const k of allowed) if (k in req.body) body[k] = req.body[k];
 
-      // Normaliza strings
       if (typeof body.title === "string") body.title = body.title.trim();
       if (typeof body.areaKey === "string") body.areaKey = body.areaKey.trim();
 
-      // Content final (prefer text si viene)
-      const finalContent = resolveFinalContent(body.content, current.content);
+      // Texto plano final (aunque llegue html)
+      const finalText = resolveFinalText(body.content, current.content);
 
-      // ✅ Fechas de baja/alta SOLO cuando cambia status
+      // Fechas baja/alta solo si cambia status
       const nextStatus = typeof body.status === "string" ? body.status : current.status;
 
       const statusPatch = {};
       if (current.status !== nextStatus) {
-        if (nextStatus === "inactive") {
-          statusPatch.fechaBaja = new Date();
-        }
-        if (current.status === "inactive" && nextStatus === "active") {
-          statusPatch.fechaAlta = new Date();
-        }
+        if (nextStatus === "inactive") statusPatch.fechaBaja = new Date();
+        if (current.status === "inactive" && nextStatus === "active") statusPatch.fechaAlta = new Date();
       }
 
       const updated = await Machote.findByIdAndUpdate(
@@ -207,9 +214,9 @@ baseRoutes.forEach((base) => {
           $set: {
             ...body,
             content: {
-              text: finalContent.text || "",
-              html: finalContent.html || "",
-              json: finalContent.json ?? null
+              text: finalText,
+              html: "",  // no guardar
+              json: null // no guardar
             },
             ...statusPatch
           }
@@ -224,17 +231,12 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  /* =========================================================
-     ✅ Soft delete: dar de baja / reactivar
-     ========================================================= */
-
-  // 7) Dar de baja
+  // Dar de baja
   app.post(`${base}/:id/deactivate`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
       if (!current) return res.status(404).json({ error: "Machote no encontrado" });
 
-      // Si ya está inactive, no sobreescribir fechaBaja
       if (current.status === "inactive") {
         return res.json({ message: "Machote ya estaba dado de baja", data: current });
       }
@@ -252,13 +254,12 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 8) Reactivar
+  // Reactivar
   app.post(`${base}/:id/reactivate`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
       if (!current) return res.status(404).json({ error: "Machote no encontrado" });
 
-      // Si ya está active, no sobreescribir fechaAlta
       if (current.status === "active") {
         return res.json({ message: "Machote ya estaba activo", data: current });
       }
@@ -276,7 +277,7 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // 9) DELETE ahora es BAJA (para no romper el front)
+  // DELETE como baja
   app.delete(`${base}/:id`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
@@ -300,7 +301,7 @@ baseRoutes.forEach((base) => {
   });
 });
 
-// 10) DB + Start
+// DB + Start
 const port = process.env.PORT || 5055;
 
 async function main() {
@@ -308,7 +309,7 @@ async function main() {
     dbName: process.env.DB_NAME || "maprise"
   });
 
-  console.log("✅ Mongo conectado (db:", process.env.DB_NAME || "maprise", ")");
+  console.log("Mongo conectado (db:", process.env.DB_NAME || "maprise", ")");
   app.listen(port, () => console.log(`Microservice running on http://localhost:${port}`));
 }
 
