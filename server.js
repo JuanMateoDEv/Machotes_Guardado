@@ -32,11 +32,61 @@ function normalizeActor(actor = {}) {
 }
 
 /* =========================================================
+   Helpers de referencia de hoja membretada
+   ========================================================= */
+
+const LetterheadRefSchema = new mongoose.Schema(
+  {
+    id: { type: String, default: "", index: true },
+    areaId: { type: String, default: "" },
+    nombre: { type: String, default: "" }
+  },
+  { _id: false }
+);
+
+function normalizeLetterheadRef(input = {}) {
+  return {
+    id:
+      typeof input?.id === "string"
+        ? input.id.trim()
+        : typeof input?._id === "string"
+          ? input._id.trim()
+          : "",
+    areaId:
+      typeof input?.areaId === "string"
+        ? input.areaId.trim()
+        : "",
+    nombre:
+      typeof input?.nombre === "string"
+        ? input.nombre.trim()
+        : ""
+  };
+}
+
+function resolveLetterheadRef(body = {}, current = {}) {
+  const incomingRef = normalizeLetterheadRef(body.letterheadRef || {});
+
+  return {
+    letterheadRef: {
+      id: incomingRef.id || current?.letterheadRef?.id || "",
+      areaId: incomingRef.areaId || current?.letterheadRef?.areaId || "",
+      nombre: incomingRef.nombre || current?.letterheadRef?.nombre || ""
+    },
+    // Compatibilidad temporal con el front viejo
+    letterheadUrl:
+      typeof body.letterheadUrl === "string"
+        ? body.letterheadUrl.trim()
+        : current?.letterheadUrl || ""
+  };
+}
+
+/* =========================================================
    Modelo (machote)
    - Soft delete con status + fechaBaja/fechaAlta
    - Guardamos SOLO texto en content.text
    - Ignoramos html/json para no almacenar etiquetas
    - Se agrega auditoría de usuario
+   - Se agrega referencia formal a hoja membretada
    ========================================================= */
 
 const MachoteSchema = new mongoose.Schema(
@@ -60,6 +110,10 @@ const MachoteSchema = new mongoose.Schema(
       json: { type: mongoose.Schema.Types.Mixed, default: null }
     },
 
+    // Referencia formal a la hoja membretada
+    letterheadRef: { type: LetterheadRefSchema, default: () => ({}) },
+
+    // Compatibilidad temporal
     letterheadUrl: { type: String, default: "" },
 
     // Auditoría de usuarios
@@ -194,7 +248,6 @@ baseRoutes.forEach((base) => {
         area = "",
         status = "active",
         content = {},
-        letterheadUrl = "",
         actor = {}
       } = req.body;
 
@@ -208,6 +261,7 @@ baseRoutes.forEach((base) => {
 
       const finalText = resolveFinalText(content, {});
       const auditActor = normalizeActor(actor);
+      const letterheadData = resolveLetterheadRef(req.body, {});
 
       const now = new Date();
       const fechaBaja = status === "inactive" ? now : null;
@@ -223,7 +277,7 @@ baseRoutes.forEach((base) => {
           html: "",
           json: null
         },
-        letterheadUrl,
+        ...letterheadData,
         createdBy: auditActor,
         updatedBy: auditActor,
         deactivatedBy: status === "inactive" ? auditActor : {},
@@ -248,7 +302,15 @@ baseRoutes.forEach((base) => {
       }
 
       // Whitelist para no aceptar basura
-      const allowed = ["title", "areaKey", "area", "status", "content", "letterheadUrl"];
+      const allowed = [
+        "title",
+        "areaKey",
+        "area",
+        "status",
+        "content",
+        "letterheadUrl",
+        "letterheadRef"
+      ];
       const body = {};
 
       for (const k of allowed) {
@@ -260,6 +322,7 @@ baseRoutes.forEach((base) => {
 
       const finalText = resolveFinalText(body.content, current.content);
       const auditActor = normalizeActor(req.body.actor || {});
+      const letterheadData = resolveLetterheadRef(body, current);
 
       const nextStatus =
         typeof body.status === "string" ? body.status : current.status;
@@ -287,6 +350,7 @@ baseRoutes.forEach((base) => {
               html: "",
               json: null
             },
+            ...letterheadData,
             updatedBy: auditActor,
             ...statusPatch
           }
