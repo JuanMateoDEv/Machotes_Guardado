@@ -9,10 +9,34 @@ app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "10mb" }));
 
 /* =========================================================
+   Helpers de auditoría
+   ========================================================= */
+
+const AuditUserSchema = new mongoose.Schema(
+  {
+    userId: { type: String, default: "" },
+    name: { type: String, default: "" },
+    email: { type: String, default: "" },
+    role: { type: String, default: "" }
+  },
+  { _id: false }
+);
+
+function normalizeActor(actor = {}) {
+  return {
+    userId: typeof actor?.userId === "string" ? actor.userId.trim() : "",
+    name: typeof actor?.name === "string" ? actor.name.trim() : "",
+    email: typeof actor?.email === "string" ? actor.email.trim() : "",
+    role: typeof actor?.role === "string" ? actor.role.trim() : ""
+  };
+}
+
+/* =========================================================
    Modelo (machote)
    - Soft delete con status + fechaBaja/fechaAlta
    - Guardamos SOLO texto en content.text
    - Ignoramos html/json para no almacenar etiquetas
+   - Se agrega auditoría de usuario
    ========================================================= */
 
 const MachoteSchema = new mongoose.Schema(
@@ -20,18 +44,29 @@ const MachoteSchema = new mongoose.Schema(
     title: { type: String, required: true, index: true },
     areaKey: { type: String, required: true, index: true },
     area: { type: String, default: "" },
-    status: { type: String, enum: ["draft", "active", "inactive"], default: "active", index: true },
+    status: {
+      type: String,
+      enum: ["draft", "active", "inactive"],
+      default: "active",
+      index: true
+    },
 
     content: {
       // Fuente de verdad: texto plano
       text: { type: String, default: "" },
 
-      // Se mantienen para compatibilidad de lectura, pero NO se guardarán (se limpian en POST/PUT)
+      // Compatibilidad de lectura, pero no se persisten con contenido real
       html: { type: String, default: "" },
       json: { type: mongoose.Schema.Types.Mixed, default: null }
     },
 
     letterheadUrl: { type: String, default: "" },
+
+    // Auditoría de usuarios
+    createdBy: { type: AuditUserSchema, default: () => ({}) },
+    updatedBy: { type: AuditUserSchema, default: () => ({}) },
+    deactivatedBy: { type: AuditUserSchema, default: () => ({}) },
+    reactivatedBy: { type: AuditUserSchema, default: () => ({}) },
 
     // Auditoría de baja/reactivación
     fechaBaja: { type: Date, default: null },
@@ -49,7 +84,7 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 const baseRoutes = ["/machotes", "/templates"];
 
 /* =========================================================
-   Helpers
+   Helpers de contenido
    ========================================================= */
 
 // Convierte HTML simple a texto plano (sin dependencias)
@@ -80,6 +115,7 @@ function htmlToPlainText(html = "") {
   text = text.replace(/\r/g, "");
   text = text.replace(/[ \t]+\n/g, "\n");
   text = text.replace(/\n{3,}/g, "\n\n");
+
   return text.trim();
 }
 
@@ -88,13 +124,17 @@ function htmlToPlainText(html = "") {
 // - Si solo viene incoming.html, lo convierte a texto
 // - Si no viene nada, usa el texto actual (PUT)
 function resolveFinalText(incomingContent = {}, currentContent = {}) {
-  const incomingText = typeof incomingContent?.text === "string" ? incomingContent.text : "";
-  const incomingHtml = typeof incomingContent?.html === "string" ? incomingContent.html : "";
+  const incomingText =
+    typeof incomingContent?.text === "string" ? incomingContent.text : "";
+  const incomingHtml =
+    typeof incomingContent?.html === "string" ? incomingContent.html : "";
 
   if (incomingText.trim()) return incomingText.trim();
   if (incomingHtml.trim()) return htmlToPlainText(incomingHtml);
 
-  const currentText = typeof currentContent?.text === "string" ? currentContent.text : "";
+  const currentText =
+    typeof currentContent?.text === "string" ? currentContent.text : "";
+
   return currentText || "";
 }
 
@@ -106,11 +146,17 @@ baseRoutes.forEach((base) => {
   // Listar
   app.get(base, async (req, res) => {
     try {
-      const { areaKey = "", term = "", includeInactive = "false" } = req.query;
+      const {
+        areaKey = "",
+        term = "",
+        includeInactive = "false"
+      } = req.query;
 
       const filter = {};
       if (areaKey) filter.areaKey = areaKey;
-      if (term.trim()) filter.title = { $regex: term.trim(), $options: "i" };
+      if (typeof term === "string" && term.trim()) {
+        filter.title = { $regex: term.trim(), $options: "i" };
+      }
 
       // Por defecto excluir inactivos
       if (includeInactive !== "true") {
@@ -129,7 +175,9 @@ baseRoutes.forEach((base) => {
   app.get(`${base}/:id`, async (req, res) => {
     try {
       const doc = await Machote.findById(req.params.id).lean();
-      if (!doc) return res.status(404).json({ error: "Machote no encontrado" });
+      if (!doc) {
+        return res.status(404).json({ error: "Machote no encontrado" });
+      }
       res.json({ data: doc });
     } catch (err) {
       console.error(err);
@@ -146,16 +194,21 @@ baseRoutes.forEach((base) => {
         area = "",
         status = "active",
         content = {},
-        letterheadUrl = ""
+        letterheadUrl = "",
+        actor = {}
       } = req.body;
 
-      if (!title?.trim()) return res.status(400).json({ error: "title es requerido" });
-      if (!areaKey?.trim()) return res.status(400).json({ error: "areaKey es requerido" });
+      if (!title?.trim()) {
+        return res.status(400).json({ error: "title es requerido" });
+      }
 
-      // Texto plano final (aunque el front mande html)
+      if (!areaKey?.trim()) {
+        return res.status(400).json({ error: "areaKey es requerido" });
+      }
+
       const finalText = resolveFinalText(content, {});
+      const auditActor = normalizeActor(actor);
 
-      // Auditoría inicial (solo si lo crean ya inactivo)
       const now = new Date();
       const fechaBaja = status === "inactive" ? now : null;
       const fechaAlta = null;
@@ -167,10 +220,14 @@ baseRoutes.forEach((base) => {
         status,
         content: {
           text: finalText,
-          html: "",  // no guardar
-          json: null // no guardar
+          html: "",
+          json: null
         },
         letterheadUrl,
+        createdBy: auditActor,
+        updatedBy: auditActor,
+        deactivatedBy: status === "inactive" ? auditActor : {},
+        reactivatedBy: {},
         fechaBaja,
         fechaAlta
       });
@@ -186,26 +243,38 @@ baseRoutes.forEach((base) => {
   app.put(`${base}/:id`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
-      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+      if (!current) {
+        return res.status(404).json({ error: "Machote no encontrado" });
+      }
 
       // Whitelist para no aceptar basura
       const allowed = ["title", "areaKey", "area", "status", "content", "letterheadUrl"];
       const body = {};
-      for (const k of allowed) if (k in req.body) body[k] = req.body[k];
+
+      for (const k of allowed) {
+        if (k in req.body) body[k] = req.body[k];
+      }
 
       if (typeof body.title === "string") body.title = body.title.trim();
       if (typeof body.areaKey === "string") body.areaKey = body.areaKey.trim();
 
-      // Texto plano final (aunque llegue html)
       const finalText = resolveFinalText(body.content, current.content);
+      const auditActor = normalizeActor(req.body.actor || {});
 
-      // Fechas baja/alta solo si cambia status
-      const nextStatus = typeof body.status === "string" ? body.status : current.status;
+      const nextStatus =
+        typeof body.status === "string" ? body.status : current.status;
 
       const statusPatch = {};
       if (current.status !== nextStatus) {
-        if (nextStatus === "inactive") statusPatch.fechaBaja = new Date();
-        if (current.status === "inactive" && nextStatus === "active") statusPatch.fechaAlta = new Date();
+        if (nextStatus === "inactive") {
+          statusPatch.fechaBaja = new Date();
+          statusPatch.deactivatedBy = auditActor;
+        }
+
+        if (current.status === "inactive" && nextStatus === "active") {
+          statusPatch.fechaAlta = new Date();
+          statusPatch.reactivatedBy = auditActor;
+        }
       }
 
       const updated = await Machote.findByIdAndUpdate(
@@ -215,9 +284,10 @@ baseRoutes.forEach((base) => {
             ...body,
             content: {
               text: finalText,
-              html: "",  // no guardar
-              json: null // no guardar
+              html: "",
+              json: null
             },
+            updatedBy: auditActor,
             ...statusPatch
           }
         },
@@ -235,15 +305,29 @@ baseRoutes.forEach((base) => {
   app.post(`${base}/:id/deactivate`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
-      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+      if (!current) {
+        return res.status(404).json({ error: "Machote no encontrado" });
+      }
 
       if (current.status === "inactive") {
-        return res.json({ message: "Machote ya estaba dado de baja", data: current });
+        return res.json({
+          message: "Machote ya estaba dado de baja",
+          data: current
+        });
       }
+
+      const auditActor = normalizeActor(req.body.actor || {});
 
       const updated = await Machote.findByIdAndUpdate(
         req.params.id,
-        { $set: { status: "inactive", fechaBaja: new Date() } },
+        {
+          $set: {
+            status: "inactive",
+            fechaBaja: new Date(),
+            updatedBy: auditActor,
+            deactivatedBy: auditActor
+          }
+        },
         { new: true, runValidators: true }
       );
 
@@ -258,15 +342,29 @@ baseRoutes.forEach((base) => {
   app.post(`${base}/:id/reactivate`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
-      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+      if (!current) {
+        return res.status(404).json({ error: "Machote no encontrado" });
+      }
 
       if (current.status === "active") {
-        return res.json({ message: "Machote ya estaba activo", data: current });
+        return res.json({
+          message: "Machote ya estaba activo",
+          data: current
+        });
       }
+
+      const auditActor = normalizeActor(req.body.actor || {});
 
       const updated = await Machote.findByIdAndUpdate(
         req.params.id,
-        { $set: { status: "active", fechaAlta: new Date() } },
+        {
+          $set: {
+            status: "active",
+            fechaAlta: new Date(),
+            updatedBy: auditActor,
+            reactivatedBy: auditActor
+          }
+        },
         { new: true, runValidators: true }
       );
 
@@ -277,19 +375,33 @@ baseRoutes.forEach((base) => {
     }
   });
 
-  // DELETE como baja
+  // DELETE como baja lógica
   app.delete(`${base}/:id`, async (req, res) => {
     try {
       const current = await Machote.findById(req.params.id).lean();
-      if (!current) return res.status(404).json({ error: "Machote no encontrado" });
+      if (!current) {
+        return res.status(404).json({ error: "Machote no encontrado" });
+      }
 
       if (current.status === "inactive") {
-        return res.json({ message: "Machote ya estaba dado de baja", data: current });
+        return res.json({
+          message: "Machote ya estaba dado de baja",
+          data: current
+        });
       }
+
+      const auditActor = normalizeActor(req.body.actor || {});
 
       const updated = await Machote.findByIdAndUpdate(
         req.params.id,
-        { $set: { status: "inactive", fechaBaja: new Date() } },
+        {
+          $set: {
+            status: "inactive",
+            fechaBaja: new Date(),
+            updatedBy: auditActor,
+            deactivatedBy: auditActor
+          }
+        },
         { new: true, runValidators: true }
       );
 
@@ -310,7 +422,9 @@ async function main() {
   });
 
   console.log("Mongo conectado (db:", process.env.DB_NAME || "maprise", ")");
-  app.listen(port, () => console.log(`Microservice running on http://localhost:${port}`));
+  app.listen(port, () => {
+    console.log(`Microservice running on http://localhost:${port}`);
+  });
 }
 
 main().catch((err) => {
