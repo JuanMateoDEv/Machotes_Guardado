@@ -265,7 +265,36 @@ baseRoutes.forEach((base) => {
 app.get(base, authMiddleware, async (req, res) => {
   try {
     const { term = "", includeInactive = "false" } = req.query;
+    const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
 
+    if (!allowedAreas.length) {
+      return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
+    }
+
+    const filter = {
+      area: { $in: allowedAreas }
+    };
+
+    if (typeof term === "string" && term.trim()) {
+      filter.title = { $regex: term.trim(), $options: "i" };
+    }
+
+    if (includeInactive !== "true") {
+      filter.status = { $ne: "inactive" };
+    }
+
+    const items = await Machote.find(filter).sort({ updatedAt: -1 }).lean();
+    res.json({ items });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno", details: err.message });
+  }
+});
+
+//Mis machotes
+app.get(`${base}/mis-machotes`, authMiddleware, async (req, res) => {
+  try {
+    const { term = "", includeInactive = "false" } = req.query;
     const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
 
     if (!req.user?.uid) {
