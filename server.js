@@ -2,10 +2,49 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
+import jwt from "jsonwebtoken";
 
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "10mb" }));
+
+/* =========================================================
+   Auth middleware
+   - Verifica JWT firmado por el micro de login
+   - Toma uid, rol y areas del payload
+   ========================================================= */
+
+function authMiddleware(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const [type, token] = authHeader.split(" ");
+
+    if (type !== "Bearer" || !token) {
+      return res.status(401).json({ error: "Falta token Bearer" });
+    }
+
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+
+    req.user = {
+      uid: typeof payload?.uid === "string" ? payload.uid.trim() : "",
+      rol: typeof payload?.rol === "string" ? payload.rol.trim() : "",
+      areas: Array.isArray(payload?.areas)
+        ? payload.areas
+            .filter((x) => typeof x === "string")
+            .map((x) => x.trim())
+            .filter(Boolean)
+        : []
+    };
+
+    if (!req.user.uid) {
+      return res.status(401).json({ error: "Token inválido: uid no disponible" });
+    }
+
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Token inválido o expirado" });
+  }
+}
 
 /* =========================================================
    Helpers de auditoría
@@ -23,10 +62,16 @@ const AuditUserSchema = new mongoose.Schema(
 
 function normalizeActor(actor = {}) {
   return {
-    userId: typeof actor?.userId === "string" ? actor.userId.trim() : "",
-    name:   typeof actor?.name   === "string" ? actor.name.trim()   : "",
-    email:  typeof actor?.email  === "string" ? actor.email.trim()  : "",
-    role:   typeof actor?.role   === "string" ? actor.role.trim()   : ""
+    userId:
+      typeof actor?.userId === "string" ? actor.userId.trim()
+      : typeof actor?.uid === "string" ? actor.uid.trim()
+      : "",
+    name:   typeof actor?.name === "string" ? actor.name.trim() : "",
+    email:  typeof actor?.email === "string" ? actor.email.trim() : "",
+    role:
+      typeof actor?.role === "string" ? actor.role.trim()
+      : typeof actor?.rol === "string" ? actor.rol.trim()
+      : ""
   };
 }
 
@@ -107,36 +152,25 @@ const Machote = mongoose.model("Machote", MachoteSchema, "machotes");
 
 /* =========================================================
    Modelo: Documento
-   - Representa el llenado de un machote con datos reales
-   - Folio por área: SEC-2026-0001
-   - Editable mientras status === "draft"
-   - Soft delete con status "cancelado"
    ========================================================= */
 
 const DocumentoSchema = new mongoose.Schema(
   {
-    // Referencia al machote que lo originó
     machoteId:    { type: mongoose.Schema.Types.ObjectId, required: true, ref: "Machote", index: true },
-    machoteTitle: { type: String, default: "" }, // snapshot por si el machote cambia de título
+    machoteTitle: { type: String, default: "" },
 
-    // Datos de área (copiados del machote al crear)
     areaKey: { type: String, required: true, index: true },
     area:    { type: String, default: "" },
 
-    // Folio único por área y año: SEC-2026-0001
     folio: { type: String, unique: true, index: true },
 
-    // Valores que el usuario llenó: { "Municipio": "Atotonilco", "Ingresos": "150,000" }
     campos: { type: mongoose.Schema.Types.Mixed, default: {} },
 
-    // Texto final con placeholders ya reemplazados
     contenidoFinal: { type: String, default: "" },
 
-    // Snapshot de la hoja membretada usada al momento de crear
     letterheadRef: { type: LetterheadRefSchema, default: () => ({}) },
     letterheadUrl: { type: String, default: "" },
 
-    // borrador = en proceso, final = cerrado/inmutable, cancelado = baja lógica
     status: {
       type:    String,
       enum:    ["borrador", "final", "cancelado"],
@@ -144,7 +178,6 @@ const DocumentoSchema = new mongoose.Schema(
       index:   true
     },
 
-    // Auditoría
     createdBy:   { type: AuditUserSchema, default: () => ({}) },
     updatedBy:   { type: AuditUserSchema, default: () => ({}) },
     canceladoPor: { type: AuditUserSchema, default: () => ({}) },
@@ -198,30 +231,16 @@ function resolveFinalText(incomingContent = {}, currentContent = {}) {
    Helpers de documentos
    ========================================================= */
 
-/**
- * Reemplaza [Placeholder] en el texto con los valores del objeto campos.
- * Ejemplo: interpolateText("Hola [Nombre]", { Nombre: "Juan" }) → "Hola Juan"
- * Placeholders sin valor en campos se dejan como están.
- */
 function interpolateText(text = "", campos = {}) {
   if (!text || typeof text !== "string") return "";
   return text.replace(/\[([^\]]+)\]/g, (match, key) => {
     const val = campos[key];
     return val !== undefined && val !== null && String(val).trim() !== ""
       ? String(val).trim()
-      : match; // si no hay valor, deja el placeholder
+      : match;
   });
 }
 
-/**
- * Genera folio único por área y año.
- * Formato: {areaKey}-{año}-{numero 4 dígitos}
- * Ejemplo: SEC-2026-0001
- *
- * Usa countDocuments para calcular el siguiente número.
- * NOTA: En alta concurrencia podría haber colisiones; para ese caso
- * se recomienda una colección de contadores con findOneAndUpdate + $inc.
- */
 async function generateFolio(areaKey) {
   const year  = new Date().getFullYear();
   const start = new Date(`${year}-01-01T00:00:00.000Z`);
@@ -236,39 +255,66 @@ async function generateFolio(areaKey) {
 }
 
 /* =========================================================
-   Rutas: Machotes (sin cambios respecto a tu código original)
+   Rutas: Machotes
    ========================================================= */
 
 const baseRoutes = ["/machotes", "/templates"];
 
 baseRoutes.forEach((base) => {
   // Listar
-  app.get(base, async (req, res) => {
-    try {
-      const { areaKey = "", term = "", includeInactive = "false" } = req.query;
-      const filter = {};
-      if (areaKey) filter.areaKey = areaKey;
-      if (typeof term === "string" && term.trim()) {
-        filter.title = { $regex: term.trim(), $options: "i" };
-      }
-      if (includeInactive !== "true") {
-        filter.status = { $ne: "inactive" };
-      }
-      const items = await Machote.find(filter).sort({ updatedAt: -1 }).lean();
-      res.json({ items });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Error interno", details: err.message });
+app.get(base, authMiddleware, async (req, res) => {
+  try {
+    const { term = "", includeInactive = "false" } = req.query;
+
+    const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
+
+    if (!req.user?.uid) {
+      return res.status(403).json({ error: "El usuario autenticado no es válido" });
     }
-  });
+
+    if (!allowedAreas.length) {
+      return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
+    }
+
+    const filter = {
+      area: { $in: allowedAreas },
+      "createdBy.userId": req.user.uid
+    };
+
+    if (typeof term === "string" && term.trim()) {
+      filter.title = { $regex: term.trim(), $options: "i" };
+    }
+
+    if (includeInactive !== "true") {
+      filter.status = { $ne: "inactive" };
+    }
+
+    const items = await Machote.find(filter).sort({ updatedAt: -1 }).lean();
+    res.json({ items });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno", details: err.message });
+  }
+});
 
   // Obtener 1
-  app.get(`${base}/:id`, async (req, res) => {
+  app.get(`${base}/:id`, authMiddleware, async (req, res) => {
     try {
       if (!mongoose.isValidObjectId(req.params.id)) {
         return res.status(400).json({ error: "ID inválido" });
       }
-      const doc = await Machote.findById(req.params.id).lean();
+
+      const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
+
+      if (!allowedAreas.length) {
+        return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
+      }
+
+      const doc = await Machote.findOne({
+        _id: req.params.id,
+        area: { $in: allowedAreas }
+      }).lean();
+
       if (!doc) return res.status(404).json({ error: "Machote no encontrado" });
       res.json({ data: doc });
     } catch (err) {
@@ -433,8 +479,6 @@ baseRoutes.forEach((base) => {
    Rutas: Documentos
    ========================================================= */
 
-// GET /documentos — historial de documentos llenados
-// Query params: machoteId, areaKey, status, term (busca en folio), page, limit
 app.get("/documentos", async (req, res) => {
   try {
     const {
@@ -453,7 +497,7 @@ app.get("/documentos", async (req, res) => {
     }
     if (areaKey) filter.areaKey = areaKey;
     if (status)  filter.status  = status;
-    else         filter.status  = { $ne: "cancelado" }; // excluir cancelados por defecto
+    else         filter.status  = { $ne: "cancelado" };
 
     if (typeof term === "string" && term.trim()) {
       filter.folio = { $regex: term.trim(), $options: "i" };
@@ -483,7 +527,6 @@ app.get("/documentos", async (req, res) => {
   }
 });
 
-// GET /documentos/:id — obtener un documento
 app.get("/documentos/:id", async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
@@ -498,19 +541,10 @@ app.get("/documentos/:id", async (req, res) => {
   }
 });
 
-// POST /documentos — crear un documento llenado a partir de un machote
-// Body esperado:
-// {
-//   machoteId: "...",
-//   campos: { "Municipio": "Atotonilco", "Ingresos": "150,000", "Egresos": "120,000" },
-//   status: "draft" | "final",   (opcional, default: "draft")
-//   actor: { userId, name, email, role }
-// }
 app.post("/documentos", async (req, res) => {
   try {
     const { machoteId, campos = {}, status = "borrador", actor = {} } = req.body;
 
-    // Validaciones
     if (!machoteId) {
       return res.status(400).json({ error: "machoteId es requerido" });
     }
@@ -521,7 +555,6 @@ app.post("/documentos", async (req, res) => {
       return res.status(400).json({ error: "status debe ser borrador o final" });
     }
 
-    // Verificar que el machote existe y está activo
     const machote = await Machote.findById(machoteId).lean();
     if (!machote) {
       return res.status(404).json({ error: "Machote no encontrado" });
@@ -530,7 +563,6 @@ app.post("/documentos", async (req, res) => {
       return res.status(400).json({ error: "No se puede crear un documento de un machote inactivo" });
     }
 
-    // Generar folio y texto interpolado
     const folio          = await generateFolio(machote.areaKey);
     const contenidoFinal = interpolateText(machote.content?.text || "", campos);
     const auditActor     = normalizeActor(actor);
@@ -543,7 +575,6 @@ app.post("/documentos", async (req, res) => {
       folio,
       campos,
       contenidoFinal,
-      // Snapshot de la hoja membretada al momento de crear
       letterheadRef:  machote.letterheadRef  || {},
       letterheadUrl:  machote.letterheadUrl  || "",
       status,
@@ -555,7 +586,6 @@ app.post("/documentos", async (req, res) => {
 
     res.status(201).json({ message: "Documento creado", data: created });
   } catch (err) {
-    // Folio duplicado (raro pero posible en concurrencia)
     if (err.code === 11000) {
       return res.status(409).json({ error: "Folio duplicado, intenta de nuevo" });
     }
@@ -564,13 +594,6 @@ app.post("/documentos", async (req, res) => {
   }
 });
 
-// PUT /documentos/:id — editar un documento (solo si está en draft)
-// Body esperado:
-// {
-//   campos: { "Municipio": "Nuevo valor", ... },   (opcional)
-//   status: "draft" | "final",                     (opcional, para cerrar el documento)
-//   actor: { userId, name, email, role }
-// }
 app.put("/documentos/:id", async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
@@ -580,7 +603,6 @@ app.put("/documentos/:id", async (req, res) => {
     const current = await Documento.findById(req.params.id).lean();
     if (!current) return res.status(404).json({ error: "Documento no encontrado" });
 
-    // Solo se puede editar si está en draft
     if (current.status !== "borrador") {
       return res.status(400).json({
         error: `El documento no se puede editar porque su status es "${current.status}"`
@@ -590,21 +612,18 @@ app.put("/documentos/:id", async (req, res) => {
     const { campos, status, actor = {} } = req.body;
     const auditActor = normalizeActor(actor);
 
-    // Validar status si viene
     if (status && !["borrador", "final"].includes(status)) {
       return res.status(400).json({ error: "status debe ser borrador o final" });
     }
 
-    // Recalcular contenido si cambian los campos
     const nextCampos = campos && typeof campos === "object"
-      ? { ...current.campos, ...campos } // merge: conserva campos no enviados
+      ? { ...current.campos, ...campos }
       : current.campos;
 
-    // Necesitamos el texto base del machote para re-interpolar
     const machote = await Machote.findById(current.machoteId).lean();
     const contenidoFinal = machote
       ? interpolateText(machote.content?.text || "", nextCampos)
-      : current.contenidoFinal; // fallback si el machote fue eliminado
+      : current.contenidoFinal;
 
     const updated = await Documento.findByIdAndUpdate(
       req.params.id,
@@ -626,7 +645,6 @@ app.put("/documentos/:id", async (req, res) => {
   }
 });
 
-// DELETE /documentos/:id — baja lógica (status: cancelado)
 app.delete("/documentos/:id", async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
