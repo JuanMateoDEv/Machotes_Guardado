@@ -267,13 +267,19 @@ app.get(base, authMiddleware, async (req, res) => {
     const { term = "", includeInactive = "false" } = req.query;
     const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
 
-    if (!allowedAreas.length) {
-      return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
-    }
+    const isSuperAdmin =
+      String(req.user?.rol || "").trim().toLowerCase() === "administrador" ||
+      String(req.user?.rol || "").trim().toUpperCase() === "ADMIN";
 
-    const filter = {
-      area: { $in: allowedAreas }
-    };
+    const filter = {};
+
+    if (!isSuperAdmin) {
+      if (!allowedAreas.length) {
+        return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
+      }
+
+      filter.area = { $in: allowedAreas };
+    }
 
     if (typeof term === "string" && term.trim()) {
       filter.title = { $regex: term.trim(), $options: "i" };
@@ -297,18 +303,24 @@ app.get(`${base}/mis-machotes`, authMiddleware, async (req, res) => {
     const { term = "", includeInactive = "false" } = req.query;
     const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
 
+    const isSuperAdmin =
+      String(req.user?.rol || "").trim().toLowerCase() === "administrador" ||
+      String(req.user?.rol || "").trim().toUpperCase() === "ADMIN";
+
     if (!req.user?.uid) {
       return res.status(403).json({ error: "El usuario autenticado no es válido" });
     }
 
-    if (!allowedAreas.length) {
-      return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
-    }
+    const filter = {};
 
-    const filter = {
-      area: { $in: allowedAreas },
-      "createdBy.userId": req.user.uid
-    };
+    if (!isSuperAdmin) {
+      if (!allowedAreas.length) {
+        return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
+      }
+
+      filter.area = { $in: allowedAreas };
+      filter["createdBy.userId"] = req.user.uid;
+    }
 
     if (typeof term === "string" && term.trim()) {
       filter.title = { $regex: term.trim(), $options: "i" };
