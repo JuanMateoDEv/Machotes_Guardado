@@ -338,31 +338,42 @@ app.get(`${base}/mis-machotes`, authMiddleware, async (req, res) => {
   }
 });
 
-  // Obtener 1
+  // Obtener 1 por ID
   app.get(`${base}/:id`, authMiddleware, async (req, res) => {
-    try {
-      if (!mongoose.isValidObjectId(req.params.id)) {
-        return res.status(400).json({ error: "ID inválido" });
-      }
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "ID inválido" });
+    }
 
-      const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
+    const allowedAreas = Array.isArray(req.user?.areas) ? req.user.areas : [];
 
+    const isSuperAdmin =
+      String(req.user?.rol || "").trim().toLowerCase() === "administrador" ||
+      String(req.user?.rol || "").trim().toUpperCase() === "ADMIN";
+
+    let doc;
+
+    if (isSuperAdmin) {
+      doc = await Machote.findById(req.params.id).lean();
+    } else {
       if (!allowedAreas.length) {
         return res.status(403).json({ error: "El usuario no tiene áreas permitidas" });
       }
 
-      const doc = await Machote.findOne({
+      doc = await Machote.findOne({
         _id: req.params.id,
         area: { $in: allowedAreas }
       }).lean();
-
-      if (!doc) return res.status(404).json({ error: "Machote no encontrado" });
-      res.json({ data: doc });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Error interno", details: err.message });
     }
-  });
+
+    if (!doc) return res.status(404).json({ error: "Machote no encontrado" });
+
+    res.json({ data: doc });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error interno", details: err.message });
+  }
+});
 
   // Crear
   app.post(base, async (req, res) => {
